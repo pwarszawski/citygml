@@ -22,9 +22,9 @@ namespace fs = std::filesystem;
 // Konfiguracja pobierana z pliku .ini
 // ----------------------------------------------------------------
 struct Config {
-    std::string trackFilename = "EXPORT.SCN";
-    std::string terrainFilename = "teren.scm";
-    std::string inputDir = "CityGML-walbrzych";
+    std::string trackFilename = "scn-walbrzych/EXPORT.SCN";
+    std::string terrainFilename = "teren-walbrzych/teren.scm";
+    std::string inputDir = "gmldir-walbrzych";
     std::string outputFilename = "citygml.scm";
     double filterDistance = 2000.0; 
     bool swapGmlXy = true;        
@@ -357,6 +357,18 @@ std::string getExplicitTexture(pugi::xml_node node) {
     return ""; 
 }
 
+// ----------------------------------------------------------------
+// Obliczanie pola powierzchni trojkata 3D
+// ----------------------------------------------------------------
+double calcTriangleArea(Point a, Point b, Point c) {
+    double abx = b.x - a.x, aby = b.y - a.y, abz = b.z - a.z;
+    double acx = c.x - a.x, acy = c.y - a.y, acz = c.z - a.z;
+    double crossx = aby * acz - abz * acy;
+    double crossy = abz * acx - abx * acz;
+    double crossz = abx * acy - aby * acx;
+    return 0.5 * std::sqrt(crossx*crossx + crossy*crossy + crossz*crossz);
+}
+
 class CityGMLConverter {
     double offsetNorth = 0.0, offsetEast = 0.0;
     std::vector<Point> trackPoints; 
@@ -400,7 +412,6 @@ public:
         return { offsetEast - geoE, geoH, geoN - offsetNorth };
     }
 
-    // Dodano referencje do terrainMgr zeby moc spradzic grunt
     void processFile(const std::string& gmlPath, std::ofstream& outFile, int& globalCounter, const TerrainManager& terrainMgr) {
         pugi::xml_document doc;
         if (!doc.load_file(gmlPath.c_str())) return;
@@ -431,16 +442,25 @@ public:
             Point firstPoint = {0,0,0}; 
             bool firstPointSet = false;
 
-            // Faza 1: Parsowanie wierzchołków i obliczanie normalnych
+            // Faza 1: Parsowanie wierzchołków
             for (auto& surface : surfacesToProcess) {
-                pugi::xml_node posNode = surface.child("gml:lod2MultiSurface");
-                if (!posNode) posNode = surface;
-                posNode = posNode.select_node(".//*[local-name()='posList']").node();
-                if (!posNode) continue;
+                std::vector<double> raw;
+                
+                pugi::xml_node posList = surface.select_node(".//*[local-name()='posList']").node();
+                if (posList) {
+                    std::stringstream ss(posList.child_value());
+                    std::string t;
+                    while (ss >> t) raw.push_back(parseDouble(t));
+                } 
+                else {
+                    auto posNodes = surface.select_nodes(".//*[local-name()='pos']");
+                    for (auto& posNode : posNodes) {
+                        std::stringstream ss(posNode.node().child_value());
+                        std::string t;
+                        while (ss >> t) raw.push_back(parseDouble(t));
+                    }
+                }
 
-                std::stringstream ss(posNode.child_value());
-                std::vector<double> raw; std::string t;
-                while (ss >> t) raw.push_back(parseDouble(t));
                 if (raw.size() < 9) continue;
 
                 std::vector<Point> p_vec;
@@ -449,6 +469,13 @@ public:
                     Point p;
                     if (cfg.swapGmlXy) p = transform(raw[i+1], raw[i], raw[i+2]);
                     else p = transform(raw[i], raw[i+1], raw[i+2]);
+                    
+                    // === FIX: FILTR MIN_VERTEX_DIST ===
+                    // Odrzucamy wierzcholki ktore sa zbyt blisko poprzedniego
+                    if (!p_vec.empty() && distSq3D(p_vec.back(), p) < cfg.minVertexDistSq) {
+                        continue;
+                    }
+
                     p_vec.push_back(p);
                     if (!firstPointSet) { firstPoint = p; firstPointSet = true; }
                     
@@ -461,11 +488,12 @@ public:
                     if (p.z > buildMaxZ) buildMaxZ = p.z;
                 }
 
-                if (p_vec.size() > 3 && 
-                    std::abs(p_vec.front().x - p_vec.back().x) < 0.01 &&
-                    std::abs(p_vec.front().z - p_vec.back().z) < 0.01) {
+                // === FIX: CITYGML ZAMYKAJACY POLIGON ===
+                // Usuniecie zduplikowanego pierwszego punktu na samym koncu ringu
+                while (p_vec.size() > 3 && distSq3D(p_vec.front(), p_vec.back()) < cfg.minVertexDistSq) {
                     p_vec.pop_back();
                 }
+                
                 if (p_vec.size() < 3) continue;
 
                 Vector3 n = calculateNewellNormal(p_vec);
@@ -494,16 +522,15 @@ public:
             double centerZ = (buildMinZ + buildMaxZ) / 2.0;
             double terrainY = 0.0;
             
-            // Szukamy wysokosci terenu pod srodkiem budynku
             if (terrainMgr.getHeightAt(centerX, centerZ, terrainY)) {
-                double shiftY = terrainY - buildMinY; // Zmiana wymagana by postawic budynek na ziemi
+                double shiftY = terrainY - buildMinY; 
                 for (auto& pd : polys) {
                     pd.centerY += shiftY;
                     for (auto& v : pd.verts) {
-                        v.y += shiftY; // Przesuwamy budynek
+                        v.y += shiftY; 
                     }
                 }
-                buildMinY += shiftY; // Aktualizacja punktu zerowego budynku
+                buildMinY += shiftY; 
             }
 
             struct OutputMesh { std::vector<Point> v; std::vector<Vector3> n; };
@@ -540,9 +567,21 @@ public:
                 std::vector<int> indices = triangulatePolygon(pd.verts, pd.normal);
                 if (flipWinding) std::reverse(indices.begin(), indices.end());
 
-                for (size_t i = 0; i < indices.size(); ++i) {
-                    groups[tex].v.push_back(pd.verts[indices[i]]);
-                    groups[tex].n.push_back(pd.normal);
+                // === FIX: FILTR MIN_TRIANGLE_AREA ===
+                // Pobieramy trojkaty grupami po 3 wierzcholki
+                for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+                    Point pA = pd.verts[indices[i]];
+                    Point pB = pd.verts[indices[i+1]];
+                    Point pC = pd.verts[indices[i+2]];
+
+                    // Jesli trojkat ma zerowe pole (degenerate triangle), pomijamy go
+                    if (calcTriangleArea(pA, pB, pC) < cfg.minTriangleArea) {
+                        continue;
+                    }
+
+                    groups[tex].v.push_back(pA); groups[tex].n.push_back(pd.normal);
+                    groups[tex].v.push_back(pB); groups[tex].n.push_back(pd.normal);
+                    groups[tex].v.push_back(pC); groups[tex].n.push_back(pd.normal);
                 }
             }
 
@@ -613,5 +652,8 @@ int main() {
     }
     
     std::cout << "\nZakonczono pomyslnie. Wygenerowano: " << counter - 1 << " obiektow.\n";
+    
+    std::cout << "Nacisnij klawisz Enter, aby zakonczyc..." << std::endl;
+    std::cin.get();
     return 0;
 }
